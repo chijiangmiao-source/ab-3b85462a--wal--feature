@@ -66,6 +66,9 @@ class RecoveryResult:
     image: bytes = b""
     digest_alg: str = "sha256"
     digest: str = ""
+    # Frame the caller asked to recover at; None means "last recoverable
+    # commit" (in which case commit_frame is exactly that boundary).
+    requested_target: int | None = None
     # WAL structural diagnostics: recovery stops at the first invalid frame;
     # the image still reflects a complete earlier commit, never a partial one.
     valid_frames: int = 0
@@ -83,6 +86,7 @@ class RecoveryResult:
         wal_pages = sum(1 for src in self.page_sources.values() if src > 0)
         return {
             "status": "recovered" if self.wal_complete else "recovered_with_invalid_tail",
+            "target_frame": self.requested_target,
             "commit_frame": self.commit_frame,
             "recovered_pages": len(self.image) // self.page_size,
             "wal_pages": wal_pages,
@@ -279,11 +283,20 @@ def _parse_frames(wal: bytes, hdr: dict) -> tuple[list[FrameInfo], int | None, s
     return frames, truncation_offset, truncation_reason
 
 
-def recover(db: bytes, wal: bytes) -> RecoveryResult:
-    """Rebuild the image of the last recoverable commit.
+def recover(db: bytes, wal: bytes, target_frame: int | None = None) -> RecoveryResult:
+    """Rebuild the image of a committed transaction in the WAL.
 
-    Raises RecoveryError on any malformed input or when no complete commit
-    exists; never returns a partial image.
+    With ``target_frame=None`` the image is that of the last recoverable
+    commit. With an explicit 1-based frame number, the image is rebuilt at
+    that historical commit boundary instead: the target must be among the
+    checksum-validated frames and carry a non-zero commit database size.
+    Each recovered page then takes only its last image at or before the
+    target frame, so later commits and spilled uncommitted frames never
+    enter the image.
+
+    Raises RecoveryError on any malformed input, when no complete commit
+    exists, or when the requested target cannot be served a fully verified
+    image; a partial image is never returned.
     """
     if len(wal) > MAX_WAL_SIZE:
         raise RecoveryError(
@@ -313,13 +326,10 @@ def recover(db: bytes, wal: bytes) -> RecoveryResult:
             "commit"
         )
 
-    # Recovery prefix: up to the last checksum-valid frame (every frame here
-    # is validated) that commits a non-zero database size.
-    commit = None
-    for fr in frames:
-        if fr.db_size > 0:
-            commit = fr
-    if commit is None:
+    # Commit boundaries among the checksum-validated frames: only a frame
+    # carrying a non-zero database size ends a complete transaction.
+    commit_frames = [fr for fr in frames if fr.db_size > 0]
+    if not commit_frames:
         raise RecoveryError(
             "no frame carries a non-zero commit database size among the %d "
             "validated frame(s)%s: the WAL holds no complete recoverable "
@@ -333,6 +343,52 @@ def recover(db: bytes, wal: bytes) -> RecoveryResult:
             ),
             offset=bad_offset,
         )
+
+    if target_frame is None:
+        # Default boundary: the last validated commit.
+        commit = commit_frames[-1]
+    else:
+        if not isinstance(target_frame, int) or isinstance(target_frame, bool):
+            raise RecoveryError(
+                "target frame must be an integer frame number, got %r"
+                % (target_frame,)
+            )
+        if target_frame <= 0:
+            raise RecoveryError(
+                "target frame number must be 1-based and positive, got %d"
+                % target_frame
+            )
+        if bad_offset is not None and target_frame > len(frames):
+            # The requested frame is the first invalid one or lies behind it.
+            raise RecoveryError(
+                "target frame %d is at or beyond the first invalid frame "
+                "(frame %d at offset %d: %s), so it is not a verified commit "
+                "boundary"
+                % (
+                    target_frame,
+                    len(frames) + 1,
+                    bad_offset,
+                    bad_reason,
+                ),
+                offset=bad_offset,
+            )
+        if target_frame > len(frames):
+            raise RecoveryError(
+                "target frame %d does not exist: the WAL holds only %d "
+                "checksum-validated frame(s)" % (target_frame, len(frames))
+            )
+        commit = frames[target_frame - 1]
+        if commit.db_size == 0:
+            raise RecoveryError(
+                "target frame %d is not a commit frame (commit database size "
+                "is 0): it belongs to an uncommitted transaction"
+                % target_frame,
+                offset=commit.offset,
+            )
+
+    # Recovery prefix: every validated frame up to and including the chosen
+    # commit boundary; nothing later (newer commits, uncommitted spills) is
+    # allowed to contribute a page image.
     prefix = frames[: commit.number]
 
     # Every frame in the prefix belongs to a transaction ending at a commit
@@ -394,6 +450,7 @@ def recover(db: bytes, wal: bytes) -> RecoveryResult:
         },
         image=image,
         digest=hashlib.sha256(image).hexdigest(),
+        requested_target=target_frame,
         valid_frames=len(frames),
         wal_complete=bad_offset is None,
         first_invalid_offset=bad_offset,

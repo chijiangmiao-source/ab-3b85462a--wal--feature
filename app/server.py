@@ -2,7 +2,8 @@
 
 POST /recover
     JSON body: {"database_base64": "...", "wal_base64": "...",
-                "page_order": "numeric" | "frame"}
+                "page_order": "numeric" | "frame",
+                "target_frame": <optional 1-based commit frame number>}
 GET  /health
     liveness probe used by Compose.
 
@@ -75,6 +76,22 @@ class RecoveryHandler(BaseHTTPRequestHandler):
         db_b64 = payload.get("database_base64", "")
         wal_b64 = payload.get("wal_base64", "")
         page_order = payload.get("page_order", "numeric")
+        if "target_frame" in payload and payload["target_frame"] is not None:
+            raw_target = payload["target_frame"]
+            if isinstance(raw_target, bool) or not isinstance(raw_target, int) \
+                    or raw_target <= 0:
+                self._send_json(
+                    400,
+                    {
+                        "status": "error",
+                        "error": "target_frame must be a positive 1-based "
+                                 "frame number",
+                    },
+                )
+                return
+            target_frame: int | None = raw_target
+        else:
+            target_frame = None
         if not isinstance(db_b64, str) or not isinstance(wal_b64, str):
             self._send_json(
                 400,
@@ -113,7 +130,7 @@ class RecoveryHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = recover(db, wal)
+            result = recover(db, wal, target_frame=target_frame)
         except RecoveryError as exc:
             # No partial image is ever returned on failure.
             self._send_json(
