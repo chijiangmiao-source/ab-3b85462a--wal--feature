@@ -1,0 +1,31 @@
+services:
+  recovery:
+    build: .
+    image: wal-recovery:latest
+    environment:
+      PORT: "8080"
+    ports:
+      # Configurable host port: HOST_PORT=9090 docker compose up
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=2); sys.exit(0 if r.status==200 and json.load(r)['status']=='ok' else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  # One-shot acceptance: engine tests, image build path and HTTP smoke.
+  # Run with:  docker compose up --build verify
+  # The exit code of this service is the verdict (0 = accepted).
+  verify:
+    build: .
+    image: wal-recovery:latest
+    depends_on:
+      recovery:
+        condition: service_healthy
+    environment:
+      TARGET_URL: "http://recovery:8080"
+      PYTHONPATH: "/srv/app:/srv/tests"
+    command: ["tests/verify.sh"]
+    restart: "no"
