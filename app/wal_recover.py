@@ -279,12 +279,31 @@ def _parse_frames(wal: bytes, hdr: dict) -> tuple[list[FrameInfo], int | None, s
     return frames, truncation_offset, truncation_reason
 
 
-def recover(db: bytes, wal: bytes) -> RecoveryResult:
-    """Rebuild the image of the last recoverable commit.
+def recover(db: bytes, wal: bytes, target_frame: int | None = None) -> RecoveryResult:
+    """Rebuild the image of a recoverable commit.
+
+    With ``target_frame`` unset, the image is rebuilt at the last checksum-
+    valid frame that commits a non-zero database size (historical default).
+    With ``target_frame`` set to a 1-based frame ordinal, the image is rebuilt
+    exactly at that historical commit boundary: every recovered page takes
+    only its last image at or before the target frame, so later commits and
+    uncommitted transactions can never leak in. The target must itself be a
+    fully validated commit frame; a missing, uncommitted or not-yet-validated
+    (past the first invalid frame) target raises RecoveryError.
 
     Raises RecoveryError on any malformed input or when no complete commit
     exists; never returns a partial image.
     """
+    if target_frame is not None and (
+        not isinstance(target_frame, int)
+        or isinstance(target_frame, bool)
+        or target_frame < 1
+    ):
+        raise RecoveryError(
+            "target_frame must be a positive integer, got %r" % (target_frame,),
+            scope="request",
+        )
+
     if len(wal) > MAX_WAL_SIZE:
         raise RecoveryError(
             "WAL exceeds %d-byte limit (%d bytes)" % (MAX_WAL_SIZE, len(wal)),
@@ -313,26 +332,55 @@ def recover(db: bytes, wal: bytes) -> RecoveryResult:
             "commit"
         )
 
-    # Recovery prefix: up to the last checksum-valid frame (every frame here
-    # is validated) that commits a non-zero database size.
-    commit = None
-    for fr in frames:
-        if fr.db_size > 0:
-            commit = fr
-    if commit is None:
-        raise RecoveryError(
-            "no frame carries a non-zero commit database size among the %d "
-            "validated frame(s)%s: the WAL holds no complete recoverable "
-            "commit"
-            % (
-                len(frames),
-                "; the WAL then becomes invalid at offset %d (%s)"
-                % (bad_offset, bad_reason)
-                if bad_offset is not None
-                else "",
-            ),
-            offset=bad_offset,
-        )
+    # Commit boundaries proven by validated frames: frame number -> frame,
+    # for every validated frame carrying a non-zero commit database size.
+    # Their chronological order (and which transaction each frame belongs
+    # to) lets recovery rebuild the image at any historical commit point.
+    commit_frames: dict[int, FrameInfo] = {
+        fr.number: fr for fr in frames if fr.db_size > 0
+    }
+
+    if target_frame is None:
+        # Default: the last recoverable commit within the validated prefix.
+        commit = next((fr for fr in reversed(frames) if fr.db_size > 0), None)
+        if commit is None:
+            raise RecoveryError(
+                "no frame carries a non-zero commit database size among the "
+                "%d validated frame(s)%s: the WAL holds no complete "
+                "recoverable commit"
+                % (
+                    len(frames),
+                    "; the WAL then becomes invalid at offset %d (%s)"
+                    % (bad_offset, bad_reason)
+                    if bad_offset is not None
+                    else "",
+                ),
+                offset=bad_offset,
+            )
+    else:
+        if target_frame > len(frames):
+            if bad_offset is not None:
+                why = (
+                    "the WAL becomes invalid at offset %d (%s) before frame "
+                    "%d is validated" % (bad_offset, bad_reason, target_frame)
+                )
+            else:
+                why = "the WAL contains only %d validated frame(s)" % len(frames)
+            raise RecoveryError(
+                "target commit frame %d does not exist: %s" % (target_frame, why),
+                offset=bad_offset,
+            )
+        commit = commit_frames.get(target_frame)
+        if commit is None:
+            target = frames[target_frame - 1]
+            raise RecoveryError(
+                "target frame %d is not a commit frame (commit database size "
+                "is 0): it belongs to an uncommitted transaction and cannot "
+                "be used as a recovery boundary" % target_frame,
+                offset=target.offset,
+            )
+
+    # Recovery prefix: exactly the validated frames up to the chosen commit.
     prefix = frames[: commit.number]
 
     # Every frame in the prefix belongs to a transaction ending at a commit

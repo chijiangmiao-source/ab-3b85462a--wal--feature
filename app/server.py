@@ -2,7 +2,8 @@
 
 POST /recover
     JSON body: {"database_base64": "...", "wal_base64": "...",
-                "page_order": "numeric" | "frame"}
+                "page_order": "numeric" | "frame",
+                "target_frame": <optional positive int>}
 GET  /health
     liveness probe used by Compose.
 
@@ -75,6 +76,7 @@ class RecoveryHandler(BaseHTTPRequestHandler):
         db_b64 = payload.get("database_base64", "")
         wal_b64 = payload.get("wal_base64", "")
         page_order = payload.get("page_order", "numeric")
+        target_frame = payload.get("target_frame", None)
         if not isinstance(db_b64, str) or not isinstance(wal_b64, str):
             self._send_json(
                 400,
@@ -88,6 +90,16 @@ class RecoveryHandler(BaseHTTPRequestHandler):
                     "status": "error",
                     "error": "page_order must be one of %s" % list(VALID_PAGE_ORDERS),
                 },
+            )
+            return
+        if target_frame is not None and (
+            isinstance(target_frame, bool)
+            or not isinstance(target_frame, int)
+            or target_frame < 1
+        ):
+            self._send_json(
+                400,
+                {"status": "error", "error": "target_frame must be a positive integer"},
             )
             return
 
@@ -113,7 +125,7 @@ class RecoveryHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = recover(db, wal)
+            result = recover(db, wal, target_frame=target_frame)
         except RecoveryError as exc:
             # No partial image is ever returned on failure.
             self._send_json(

@@ -13,6 +13,12 @@ Scenarios:
   5. WAL without any commit frame -> 409 and no image in the response
   6. malformed base64 -> 400
   7. page_order=frame orders sources by last-appearance frame
+  8. target_frame selects an earlier registered commit boundary and only
+     page images at or before that frame; the boundary is readable as the
+     database state of exactly that commit
+  9. target_frame omitted -> identical to the historical default response
+ 10. illegal target_frame values -> 400; uncommitted / non-existent frames
+     (also behind a corrupt WAL tail) -> 409 with no image
 """
 
 from __future__ import annotations
@@ -60,16 +66,16 @@ def _request(method: str, path: str, payload: dict | None = None):
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
-def _post_recover(db: bytes, wal: bytes, page_order: str = "numeric"):
-    return _request(
-        "POST",
-        "/recover",
-        {
-            "database_base64": base64.b64encode(db).decode("ascii"),
-            "wal_base64": base64.b64encode(wal).decode("ascii"),
-            "page_order": page_order,
-        },
-    )
+def _post_recover(db: bytes, wal: bytes, page_order: str = "numeric",
+                  target_frame=None):
+    payload = {
+        "database_base64": base64.b64encode(db).decode("ascii"),
+        "wal_base64": base64.b64encode(wal).decode("ascii"),
+        "page_order": page_order,
+    }
+    if target_frame is not None:
+        payload["target_frame"] = target_frame
+    return _request("POST", "/recover", payload)
 
 
 def _open_count(image_b64: str) -> int:
@@ -215,6 +221,116 @@ def check_page_ordering():
     return "page_order numeric/frame both honoured"
 
 
+def check_target_early_commit():
+    db, wal = walfixture.make_sqlite_wal(4096, (3, 40, 400))
+    frames, _ = walfixture.list_frames(wal)
+    commits = [f["number"] for f in frames if f["db_size"]]
+    if len(commits) < 3:
+        raise SmokeFailure("fixture produced only %d commits" % len(commits))
+    # The initial schema commit (0 rows) precedes the data commits, so the
+    # second data commit (3+40 rows) is the third commit frame overall.
+    early = commits[2]
+    expected = recover(db, wal, target_frame=early)
+    status, body = _post_recover(db, wal, target_frame=early)
+    if status != 200 or body.get("status") != "recovered":
+        raise SmokeFailure("expected 200/recovered at frame %d, got %r %r"
+                           % (early, status, body))
+    if body["commit_frame"] != early:
+        raise SmokeFailure("commit_frame %s != target %d"
+                           % (body["commit_frame"], early))
+    if body["digest"] != expected.digest:
+        raise SmokeFailure("historical image digest disagrees with engine")
+    if any(e["frame"] > early for e in body["page_sources"] if e["frame"]):
+        raise SmokeFailure("a page image from after the target frame leaked in")
+    if _open_count(body["image_base64"]) != 3 + 40:
+        raise SmokeFailure("early-commit image does not match that commit's rows")
+    return "target_frame=%d -> historical commit with %d rows, digest verified" % (
+        early, 3 + 40,
+    )
+
+
+def check_target_default_compatibility():
+    db, wal = walfixture.make_sqlite_wal(4096, (3, 40, 400))
+    frames, _ = walfixture.list_frames(wal)
+    last_commit = max(f["number"] for f in frames if f["db_size"])
+    st_default, body_default = _post_recover(db, wal)
+    st_explicit, body_explicit = _post_recover(db, wal, target_frame=last_commit)
+    if st_default != 200 or st_explicit != 200:
+        raise SmokeFailure("unexpected statuses: %r %r" % (st_default, st_explicit))
+    if body_default != body_explicit:
+        raise SmokeFailure(
+            "omitting target_frame changed the response vs explicit last commit"
+        )
+    return "omitted target_frame and explicit last commit return identical result"
+
+
+def check_target_illegal_values():
+    db, wal = walfixture.make_sqlite_wal(4096, (3, 40))
+    for bad in (0, -1, "2", 1.5, True):
+        status, body = _post_recover(db, wal, target_frame=bad)
+        if status != 400:
+            raise SmokeFailure("target_frame=%r expected 400, got %r %r"
+                               % (bad, status, body))
+    # An existing but uncommitted frame (db-size 0) is a 409, not a boundary.
+    page_size = 4096
+    syn_db = walfixture.minimal_main_db(page_size, pages=1)
+    syn_wal = walfixture.build_wal(
+        page_size,
+        [
+            {"page_no": 1, "db_size": 1, "page": walfixture.fake_page(page_size, b"C")},
+            {"page_no": 1, "db_size": 0, "page": walfixture.fake_page(page_size, b"U")},
+        ],
+    )
+    status, body = _post_recover(syn_db, syn_wal, target_frame=2)
+    if status != 409 or body.get("status") != "unrecoverable":
+        raise SmokeFailure("uncommitted target expected 409, got %r %r"
+                           % (status, body))
+    if "image_base64" in body or "not a commit frame" not in body.get("error", ""):
+        raise SmokeFailure("uncommitted-target failure malformed: %r" % body)
+    # A frame ordinal beyond the WAL.
+    status, body = _post_recover(db, wal, target_frame=10_000)
+    if status != 409 or "image_base64" in body:
+        raise SmokeFailure("missing target expected 409/no image, got %r %r"
+                           % (status, body))
+    return "illegal/missing/uncommitted target_frame rejected (400/409, no image)"
+
+
+def check_target_with_corrupt_tail():
+    db, wal = walfixture.make_sqlite_wal(4096, (3, 40))
+    page_size = struct.unpack(">I", wal[8:12])[0]
+    salt = struct.unpack(">II", wal[16:24])
+    fsz = FRAME_HEADER_SIZE + page_size
+    n_frames = (len(wal) - WAL_HEADER_SIZE) // fsz
+    last_hdr_off = WAL_HEADER_SIZE + (n_frames - 1) * fsz
+    running = struct.unpack(">II", wal[last_hdr_off + 16: last_hdr_off + 24])
+    rogue = walfixture.build_wal(
+        page_size,
+        [{"page_no": 1, "db_size": 2, "page": walfixture.fake_page(page_size, b"Z")}],
+        salt=salt,
+        initial_checksum=running,
+    )[WAL_HEADER_SIZE:]
+    broken = bytearray(wal + rogue)
+    broken[-1] ^= 0xFF  # appended frame n_frames+1 fails checksum
+    # The last committed frame, before the corruption, is still selectable.
+    status, body = _post_recover(db, bytes(broken), target_frame=n_frames)
+    if status != 200 or body.get("status") != "recovered_with_invalid_tail":
+        raise SmokeFailure("pre-tail target expected invalid-tail recovery, "
+                           "got %r %r" % (status, body))
+    if body["commit_frame"] != n_frames:
+        raise SmokeFailure("commit_frame %r != %d" % (body["commit_frame"], n_frames))
+    if _open_count(body["image_base64"]) != 3 + 40:
+        raise SmokeFailure("historical image lost committed rows")
+    # Targeting a frame at/after the first invalid one must fail without image.
+    status, body = _post_recover(db, bytes(broken), target_frame=n_frames + 1)
+    if status != 409 or body.get("status") != "unrecoverable":
+        raise SmokeFailure("post-corruption target expected 409, got %r %r"
+                           % (status, body))
+    if "image_base64" in body:
+        raise SmokeFailure("failure response must not carry an image")
+    return ("corrupt WAL tail: pre-tail commit selectable, frame %d after "
+            "first invalid frame refused" % (n_frames + 1))
+
+
 CHECKS = [
     check_health,
     check_valid_multi_transaction,
@@ -223,6 +339,10 @@ CHECKS = [
     check_no_commit_wal,
     check_bad_base64,
     check_page_ordering,
+    check_target_early_commit,
+    check_target_default_compatibility,
+    check_target_illegal_values,
+    check_target_with_corrupt_tail,
 ]
 
 

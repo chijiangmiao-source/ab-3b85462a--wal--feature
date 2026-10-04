@@ -73,6 +73,118 @@ class EngineSyntheticTests(unittest.TestCase):
         result = recover(db, wal)
         self.assertEqual(result.page_sources, {1: 1, 2: 5, 3: 4})
 
+    # ---- historical target commit selection -----------------------------
+
+    def test_target_frame_first_commit_rebuilds_first_boundary(self):
+        db, wal, _ = multi_commit_wal()  # commit frames: 2 (size 2), 4, 5
+        result = recover(db, wal, target_frame=2)
+        self.assertEqual(result.commit_frame, 2)
+        self.assertEqual(result.db_size, 2)
+        self.assertEqual(len(result.image), 2 * PAGE)
+        self.assertEqual(result.image[:PAGE], tag_page(10))
+        self.assertEqual(result.image[PAGE:2 * PAGE], tag_page(20))
+        self.assertEqual(result.page_sources, {1: 1, 2: 2})
+        # Frames 3..5 (later commits) must not leak into the old boundary.
+        self.assertNotIn(tag_page(21), result.image)
+        self.assertNotIn(tag_page(22), result.image)
+        self.assertNotIn(tag_page(30), result.image)
+
+    def test_target_frame_middle_commit_uses_images_at_or_before_target(self):
+        db, wal, _ = multi_commit_wal()
+        result = recover(db, wal, target_frame=4)
+        self.assertEqual(result.commit_frame, 4)
+        self.assertEqual(result.db_size, 3)
+        self.assertEqual(result.image[:PAGE], tag_page(10))
+        self.assertEqual(result.image[PAGE:2 * PAGE], tag_page(21))  # frame 3
+        self.assertEqual(result.image[2 * PAGE:], tag_page(30))       # frame 4
+        self.assertEqual(result.page_sources, {1: 1, 2: 3, 3: 4})
+        self.assertNotIn(tag_page(22), result.image)  # frame 5 excluded
+
+    def test_target_last_commit_matches_default_result(self):
+        db, wal, _ = multi_commit_wal()
+        defaulted = recover(db, wal)
+        targeted = recover(db, wal, target_frame=5)
+        self.assertEqual(targeted.commit_frame, defaulted.commit_frame)
+        self.assertEqual(targeted.db_size, defaulted.db_size)
+        self.assertEqual(targeted.image, defaulted.image)
+        self.assertEqual(targeted.page_sources, defaulted.page_sources)
+        self.assertEqual(targeted.digest, defaulted.digest)
+        self.assertEqual(targeted.valid_frames, defaulted.valid_frames)
+        self.assertEqual(
+            targeted.to_report(page_order="numeric"),
+            defaulted.to_report(page_order="numeric"),
+        )
+
+    def test_target_uncommitted_frame_is_refused_without_image(self):
+        db, wal, _ = multi_commit_wal()  # frame 3 has db_size 0
+        with self.assertRaises(RecoveryError) as ctx:
+            recover(db, wal, target_frame=3)
+        self.assertIn("not a commit frame", ctx.exception.message)
+        self.assertEqual(
+            ctx.exception.offset, WAL_HEADER_SIZE + 2 * FSZ
+        )  # frame 3 header
+
+    def test_target_missing_frame_is_refused(self):
+        db, wal, _ = multi_commit_wal()
+        with self.assertRaises(RecoveryError) as ctx:
+            recover(db, wal, target_frame=99)
+        self.assertIn("does not exist", ctx.exception.message)
+        self.assertIsNone(ctx.exception.offset)
+
+    def test_target_frame_validation(self):
+        db, wal, _ = multi_commit_wal()
+        for bad in (0, -1):
+            with self.assertRaises(RecoveryError):
+                recover(db, wal, target_frame=bad)
+        with self.assertRaises(RecoveryError):
+            recover(db, wal, target_frame=True)  # bool is not an ordinal
+
+    def test_target_behind_corrupt_tail_still_recovers_historical_point(self):
+        db, wal, _ = multi_commit_wal()
+        bad = wal + walfixture.build_wal(
+            PAGE,
+            [{"page_no": 3, "db_size": 3, "page": tag_page(77)}],
+        )[WAL_HEADER_SIZE:]
+        bad = bytearray(bad)
+        bad[-1] ^= 0xFF  # appended frame 6 fails its cumulative checksum
+        # Target frame 5 (before the invalid tail) remains reachable.
+        result = recover(db, bytes(bad), target_frame=5)
+        self.assertEqual(result.commit_frame, 5)
+        self.assertFalse(result.wal_complete)
+        self.assertEqual(result.image[PAGE:2 * PAGE], tag_page(22))
+        self.assertNotIn(tag_page(77), result.image)
+        # Target frame 6 is past the first invalid frame: explicit failure.
+        with self.assertRaises(RecoveryError) as ctx:
+            recover(db, bytes(bad), target_frame=6)
+        self.assertIn("does not exist", ctx.exception.message)
+        self.assertEqual(
+            ctx.exception.offset, WAL_HEADER_SIZE + 5 * FSZ + 16
+        )
+
+    def test_target_inside_truncated_tail_is_refused_but_commit_before_is_ok(self):
+        db, wal, _ = multi_commit_wal()
+        cut = wal[:-100]  # frame 5 incomplete; first invalid offset at frame 5
+        with self.assertRaises(RecoveryError) as ctx:
+            recover(db, cut, target_frame=5)
+        self.assertEqual(ctx.exception.offset, WAL_HEADER_SIZE + 4 * FSZ)
+        result = recover(db, cut, target_frame=4)
+        self.assertEqual(result.commit_frame, 4)
+        self.assertEqual(result.image[PAGE:2 * PAGE], tag_page(21))
+
+    def test_target_ignores_uncommitted_frames_after_commit(self):
+        frames = [
+            {"page_no": 1, "db_size": 2, "page": tag_page(10)},
+            {"page_no": 2, "db_size": 2, "page": tag_page(20)},
+            {"page_no": 2, "db_size": 0, "page": tag_page(99)},
+            {"page_no": 3, "db_size": 0, "page": tag_page(98)},
+        ]
+        db = walfixture.minimal_main_db(PAGE, pages=2)
+        wal = walfixture.build_wal(PAGE, frames)
+        result = recover(db, wal, target_frame=2)
+        self.assertEqual(result.image[PAGE:2 * PAGE], tag_page(20))
+        with self.assertRaises(RecoveryError):
+            recover(db, wal, target_frame=3)
+
     def test_report_orders_and_digest(self):
         db, wal, _ = multi_commit_wal()
         result = recover(db, wal)
@@ -346,7 +458,30 @@ class RealSqliteTests(unittest.TestCase):
             if src:
                 self.assertEqual(src, last_seen[page])
 
-    def test_real_wal_excludes_pages_of_open_transaction(self):
+    def test_real_wal_targets_early_commit_exactly(self):
+        db, wal = walfixture.make_sqlite_wal(4096, (3, 40, 400))
+        frames, _ = walfixture.list_frames(wal)
+        commits = [f["number"] for f in frames if f["db_size"]]
+        # Frame sequence also contains the initial schema commit (0 rows);
+        # the three data transactions commit 3, 3+40 and 3+40+400 rows.
+        first_data, second_data = commits[1], commits[2]
+        at_first = recover(db, wal, target_frame=first_data)
+        at_second = recover(db, wal, target_frame=second_data)
+        con1 = self._open_immutable(at_first.image)
+        con2 = self._open_immutable(at_second.image)
+        try:
+            self.assertEqual(
+                con1.execute("SELECT count(*) FROM telemetry").fetchone()[0], 3
+            )
+            self.assertEqual(
+                con2.execute("SELECT count(*) FROM telemetry").fetchone()[0], 3 + 40
+            )
+        finally:
+            con1.close()
+            con2.close()
+        self.assertNotEqual(at_first.digest, at_second.digest)
+
+
         db, wal = walfixture.make_sqlite_wal(
             4096, (10,), spill_uncommitted=4000, cache_size=8
         )
